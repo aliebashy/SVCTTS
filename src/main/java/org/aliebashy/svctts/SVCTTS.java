@@ -14,9 +14,14 @@ import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
 import javax.sound.sampled.*;
 import java.io.InputStream;
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+
+
 
 
 
@@ -25,11 +30,49 @@ import java.io.InputStreamReader;
 @Mod.EventBusSubscriber(modid = "svctts", bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class SVCTTS {
 
+    //private static final String STREAM_TTS_PATH = new File("stream_tts.py").getAbsolutePath();
+
+
+
+
+
     public SVCTTS() {
         System.out.println("[SVCTTS] Mod Initialized.");
         FMLJavaModLoadingContext.get().getModEventBus().register(this);
         ModLoadingContext.get().registerConfig(ModConfig.Type.CLIENT, Config.CLIENT_CONFIG);
 
+        // Shutdown Hook
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            if (pythonProcess != null) {
+                System.out.println("[SVCTTS] Shutting down persistent Python process...");
+                pythonProcess.destroy();
+            }
+        }));
+    }
+
+    private static synchronized void ModInitialization() {
+        // Initialize Python if not already
+        if (pythonExe == null) {
+            ensurePython();
+            if (pythonExe == null) {
+                System.err.println("[SVCTTS] Cannot run TTS: Python not found");
+                return;
+            }
+        }
+
+        // Load config values if not already loaded
+        if (voice == null || modelPath == null) {
+            refreshConfig();
+            if (modelPath == null) {
+                System.err.println("[SVCTTS] Cannot run TTS: modelPath is null");
+                return;
+            }
+        }
+
+        // Start persistent Python if not already running
+        if (pythonProcess == null) {
+            startPersistentPython(modelPath);
+        }
     }
 
     private static String pythonExe;
@@ -129,6 +172,170 @@ public class SVCTTS {
         }
     }
 
+    private static File getPythonScriptFile() throws IOException {
+        // Try to find the resource in the jar or classpath
+        InputStream resourceStream = SVCTTS.class.getClassLoader().getResourceAsStream("stream_tts.py");
+        if (resourceStream == null) {
+            throw new IOException("stream_tts.py resource not found in jar/classpath!");
+        }
+
+        // Copy to a temporary file
+        File tempFile = File.createTempFile("stream_tts", ".py");
+        tempFile.deleteOnExit(); // optional: deletes on JVM exit
+
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(resourceStream));
+            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(tempFile)))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                writer.write(line);
+                writer.newLine();
+            }
+        }
+
+        return tempFile;
+    }
+
+    
+    private static String voice;
+    private static double volume;
+    private static double length;
+    private static double variation;
+    private static double wVariation;
+    private static boolean normalize;
+    private static String modelPath;
+
+    private static void refreshConfig() {
+        voice = Config.VOICE.get();
+        volume = Config.VOLUME.get();
+        length = Config.LENGTH.get();
+        variation = Config.VARIATION.get();
+        wVariation = Config.W_VARIATION.get();
+        normalize = Config.NORMALIZE.get();
+
+        try {
+            modelPath = ManageVoiceModels.getVoiceModelPath(voice);
+        } catch (IOException | InterruptedException e) { // catch both exceptions
+            e.printStackTrace();
+            modelPath = null; // fallback
+        }
+    }
+
+    private static Process pythonProcess;
+    private static BufferedWriter pythonWriter;
+    private static InputStream pythonAudioStream;
+
+    private static void startPersistentPython(String voiceModelPath) {
+        if (pythonProcess != null) { // Already Running Process
+            System.out.println("[SVCTTS] Persistent Python already running with PID: " + pythonProcess.pid());
+            return; 
+        } 
+        if (voiceModelPath == null) {
+            System.err.println("[SVCTTS] Persistent Python not started: modelPath is null");
+            return;
+        }
+
+        try {
+            File scriptFile = getPythonScriptFile();
+            ProcessBuilder pb = new ProcessBuilder(
+                pythonExe, 
+                scriptFile.getAbsolutePath(),
+                voiceModelPath,
+                String.valueOf(Config.VOLUME.get()),
+                String.valueOf(Config.LENGTH.get()),
+                String.valueOf(Config.VARIATION.get()),
+                String.valueOf(Config.W_VARIATION.get()),
+                String.valueOf(Config.NORMALIZE.get()),
+                "--persistent"
+            );
+            pb.redirectErrorStream(false);
+            pythonProcess = pb.start();
+            pythonWriter = new BufferedWriter(new OutputStreamWriter(pythonProcess.getOutputStream()));
+            pythonAudioStream = pythonProcess.getInputStream();
+
+            // start a thread to log stderr / debug info
+            new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(pythonProcess.getErrorStream()))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        System.out.println("[Python] " + line);
+                    }
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }).start();
+
+        } catch (IOException e) {
+            e.printStackTrace();
+            pythonProcess = null;
+        }
+
+        // Start Audio Playback thread
+        startAudioPlayback();
+    }
+
+    private static void startAudioPlayback() {
+        new Thread(() -> {
+            try {
+                AudioFormat format = new AudioFormat(22050, 16, 1, true, false); // PCM 16-bit LE, mono
+                SourceDataLine line = AudioSystem.getSourceDataLine(format);
+                line.open(format);
+                line.start();
+
+                byte[] buffer = new byte[4096];
+                int bytesRead;
+
+                while (pythonProcess != null && pythonProcess.isAlive()) {
+                    if ((bytesRead = pythonAudioStream.read(buffer)) != -1) {
+                        // Ensure only complete frames are written
+                        int frameSize = format.getFrameSize(); // 2 bytes
+                        int bytesToWrite = bytesRead - (bytesRead % frameSize);
+                        if (bytesToWrite > 0) {
+                            line.write(buffer, 0, bytesToWrite);
+                        }
+                    } else {
+                        Thread.sleep(10); // no data, avoid busy loop
+                    }
+                }
+
+                line.drain();
+                line.stop();
+                line.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }).start();
+    }
+
+    private static void reloadPersistentPython() {
+        if (pythonProcess != null) {
+            pythonProcess.destroy(); // kill old process
+            pythonProcess = null;
+        }
+        refreshConfig();
+        startPersistentPython(modelPath);
+    }
+
+    private static void sendMessageToPython(String message) {
+        if (pythonProcess == null || !pythonProcess.isAlive()) {
+            System.err.println("[SVCTTS] Persistent Python process not running. Restarting...");
+            pythonProcess = null; // clear stale reference
+            refreshConfig();
+            startPersistentPython(modelPath);
+        }
+        if (pythonProcess == null || !pythonProcess.isAlive()) {
+            System.err.println("[SVCTTS] Failed to start persistent Python process.");
+            return;
+        }
+
+        try {
+            pythonWriter.write(message);
+            pythonWriter.newLine();
+            pythonWriter.flush();
+        } catch (IOException e) {
+            e.printStackTrace();
+            pythonProcess = null; // mark process as gone
+        }
+    }
 
 
     @SubscribeEvent
@@ -141,34 +348,32 @@ public class SVCTTS {
         event.setCanceled(true);
 
 
-        String voice = Config.VOICE.get();
-        double volume = Config.VOLUME.get();
-        double length = Config.LENGTH.get();
-        double variation = Config.VARIATION.get();
-        double wVariation = Config.W_VARIATION.get();
-        boolean normalize = Config.NORMALIZE.get();
         // Run TTS async so MC doesn't freeze
-        new Thread(() -> speakText(message, voice, volume, length, variation, wVariation, normalize)).start();
+        new Thread(() -> speakText(message)).start();
     }
 
-    private static void speakText(String message, String voice, double volume, double length, double variation, double wVariation, boolean normalize) {
-        if (pythonExe == null) { //Lazy Initialization for first time
-            ensurePython();
+    private static void speakText(String message) {
+        ModInitialization(); // make sure everything is ready
+        if (pythonExe == null || modelPath == null) return;
+
+        if (pythonProcess != null) {
+            sendMessageToPython(message);
+        } else {
+            runOneShotPython(message);
         }
-        if (pythonExe == null) { // If Still not found after ensurePython, there's an issue
-            System.err.println("[SVCTTS] Python not found; skipping TTS.");
+    }
+
+    private static void runOneShotPython(String message) {
+        if (modelPath == null) {
+            System.err.println("[SVCTTS] Cannot run one-shot TTS: modelPath is null");
             return;
-        } 
+        }
         
         try {
-            
-            // 1: Resolve Model Path, download if needed
-            String modelPath = ManageVoiceModels.getVoiceModelPath(voice);
-            
-            // 2: Run Piper TTS with set parameters
+            File scriptFile = getPythonScriptFile();
             ProcessBuilder pb = new ProcessBuilder(
                 pythonExe,
-                "stream_tts.py",
+                scriptFile.getAbsolutePath(),
                 message,
                 modelPath,
                 String.valueOf(volume),
@@ -177,63 +382,33 @@ public class SVCTTS {
                 String.valueOf(wVariation),
                 String.valueOf(normalize)
             );
-            pb.directory(new File("C:/Users/Alie/Documents/Streaming/4. Games/Minecraft - Moding/SVCTTS_2/src/main/resources"));
+            //pb.directory(new File("src/main/resources"));
             pb.redirectErrorStream(true);
-            //pb.redirectOutput(new File("python_log.txt"));
-
 
             Process process = pb.start();
-            InputStream rawAudio = process.getInputStream();        // stdout = audio
-            InputStream debugStream = process.getErrorStream();     // stderr = prints
+            InputStream rawAudio = process.getInputStream();
 
-
-            new Thread(() -> {
-                try (BufferedReader br = new BufferedReader(new InputStreamReader(debugStream))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    System.out.println("[Python] " + line);
-                }
-                } catch (IOException e) {
-                e.printStackTrace();
-                }
-            }).start();
-
-
-            // 3: Playback PCM Audio from Piper in realtime
-            // Matching Piper model format (adjust sample rate if needed)
-            AudioFormat format = new AudioFormat(
-                    22050, // sample rate of your Piper model
-                    16,    // bits per sample
-                    1,     // mono
-                    true,  // signed
-                    false  // little-endian
-            );
-
+            // Playback PCM audio (same as before)
+            AudioFormat format = new AudioFormat(22050, 16, 1, true, false);
             SourceDataLine line = AudioSystem.getSourceDataLine(format);
             line.open(format);
             line.start();
 
             byte[] buffer = new byte[4096];
             int bytesRead;
-            int frameSize = format.getFrameSize(); // 2 bytes
+            int frameSize = format.getFrameSize();
 
-            int totalBytes = 0;
             while ((bytesRead = rawAudio.read(buffer)) != -1) {
                 int bytesToWrite = bytesRead - (bytesRead % frameSize);
-                System.out.println("[Java] Read Bytes: " + bytesRead + " Writing Bytes: " + bytesToWrite);
-                totalBytes += bytesToWrite;
-                if (bytesToWrite > 0){
-                    line.write(buffer, 0, bytesToWrite);
-                }
+                if (bytesToWrite > 0) line.write(buffer, 0, bytesToWrite);
             }
-            System.out.println("[Java] Total bytes received: " + totalBytes);
 
             line.drain();
             line.stop();
             line.close();
 
         } catch (Exception e) {
-            System.err.println("[SVCTTS] Error during TTS playback:");
+            System.err.println("[SVCTTS] Error during one-shot TTS:");
             e.printStackTrace();
         }
     }
